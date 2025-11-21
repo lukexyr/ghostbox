@@ -1,86 +1,92 @@
 #!/usr/bin/env python3
 """
-BLE Central Control System for Raspberry Pi 5
+BLE Central Control System for Raspberry Pi
 Manages communication between Jet Arduino and Turning Table Arduino
-Handles the complete workflow: Idle detection -> Magnet activation -> Platform detection -> Rotation
+Workflow: Idle detection -> Magnet activation -> Platform detection -> Rotation
 """
 
 import asyncio
 import struct
-from bleak import BleakClient, BleakScanner
 import logging
-from datetime import datetime
+from bleak import BleakClient, BleakScanner
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ===== JET DEVICE CONFIGURATION =====
+# ----------------------------
+# Device Names / UUIDs
+# ----------------------------
 JET_NAME = "Eurofighter"
 JET_SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214"
-JET_DATA_CHAR = "19B10001-E8F2-537E-4F6C-D104768A1214"      # Sensor data (notify)
-JET_CONTROL_CHAR = "19B10003-E8F2-537E-4F6C-D104768A1214"   # Control/status (notify)
-JET_RX_CHAR = "19B10004-E8F2-537E-4F6C-D104768A1214"        # Commands to Jet (write)
+JET_DATA_CHAR = "19B10001-E8F2-537E-4F6C-D104768A1214"
+JET_CONTROL_CHAR = "19B10003-E8F2-537E-4F6C-D104768A1214"
 
-# ===== TABLE DEVICE CONFIGURATION =====
 TABLE_NAME = "TurningTable"
 TABLE_SERVICE_UUID = "19B20000-E8F2-537E-4F6C-D104768A1215"
-TABLE_STATUS_CHAR = "19B20001-E8F2-537E-4F6C-D104768A1215"  # Table status (notify)
-TABLE_COMMAND_CHAR = "19B20002-E8F2-537E-4F6C-D104768A1215" # Commands to Table (write)
+TABLE_STATUS_CHAR = "19B20001-E8F2-537E-4F6C-D104768A1215"
+TABLE_COMMAND_CHAR = "19B20002-E8F2-537E-4F6C-D104768A1215"
 
-# ===== JET COMMANDS =====
-CMD_RUNNING = 0x00
-CMD_IDLE = 0x01
-CMD_PLATFORM_DETECTED = 0x02
-CMD_CALIBRATE_MAG = 0x03
+# ----------------------------
+# Commands / Status
+# ----------------------------
+class JetCmd:
+    RUNNING = 0x00
+    IDLE = 0x01
+    PLATFORM_DETECTED = 0x02
 
-# ===== TABLE COMMANDS =====
-CMD_ACTIVATE_MAGNET = 0x10
-CMD_DEACTIVATE_MAGNET = 0x11
-CMD_START_ROTATION = 0x12
-CMD_STOP_ROTATION = 0x13
-CMD_SET_SPEED = 0x14
+class TableCmd:
+    ACTIVATE_MAGNET = 0x10
+    DEACTIVATE_MAGNET = 0x11
+    START_ROTATION = 0x12
+    STOP_ROTATION = 0x13
 
-# ===== TABLE STATUS =====
-STATUS_MAGNET_ON = 0x20
-STATUS_MAGNET_OFF = 0x21
-STATUS_ROTATING = 0x22
-STATUS_STOPPED = 0x23
-STATUS_READY = 0x24
+class TableStatus:
+    MAGNET_ON = 0x20
+    MAGNET_OFF = 0x21
+    ROTATING = 0x22
+    STOPPED = 0x23
+    READY = 0x24
 
-# ===== SYSTEM STATE =====
+# ----------------------------
+# System States
+# ----------------------------
 class SystemState:
     DISCONNECTED = "DISCONNECTED"
-    WAITING_FOR_JET = "WAITING_FOR_JET"
     JET_RUNNING = "JET_RUNNING"
     JET_IDLE = "JET_IDLE"
     WAITING_FOR_PLATFORM = "WAITING_FOR_PLATFORM"
     PLATFORM_DETECTED = "PLATFORM_DETECTED"
     ROTATING = "ROTATING"
-    ROTATION_COMPLETE = "ROTATION_COMPLETE"
 
-
+# ----------------------------
+# Jet Device
+# ----------------------------
 class JetDevice:
-    """Manages connection and communication with the Jet Arduino"""
-    
-    def __init__(self, address, system_controller):
+    def __init__(self, device, system_controller=None):
         self.name = JET_NAME
-        self.address = address
+        self.device = device
+        self.address = device.address
         self.client = None
         self.connected = False
         self.system = system_controller
+        self._write_lock = asyncio.Lock()
         self.last_sensor_data = None
-        
+
+    def _notify_data_callback(self, sender, data):
+        asyncio.create_task(self.notification_handler_data(sender, data))
+
+    def _notify_control_callback(self, sender, data):
+        asyncio.create_task(self.notification_handler_control(sender, data))
+
     async def notification_handler_data(self, sender, data):
-        """Handle sensor data notifications"""
         try:
-            # Unpack SensorValues struct (32 bytes)
-            # uint32_t timestamp_ms, 3x float accel, 4x float quaternion, 3x float mag, float temp
-            values = struct.unpack('<I10f', data)
-            
+            fmt = '<I11f'
+            if len(data) < struct.calcsize(fmt):
+                return
+            values = struct.unpack(fmt, data)
             self.last_sensor_data = {
                 'timestamp': values[0],
                 'accel': {'x': values[1], 'y': values[2], 'z': values[3]},
@@ -88,337 +94,364 @@ class JetDevice:
                 'mag': {'x': values[8], 'y': values[9], 'z': values[10]},
                 'temp': values[11]
             }
-            
-        except Exception as e:
-            logger.error(f"Error parsing sensor data: {e}")
-    
+        except Exception:
+            logger.exception(f"{self.name}: Error parsing sensor data")
+
     async def notification_handler_control(self, sender, data):
-        """Handle control/status notifications from Jet"""
+        if not data:
+            return
         cmd = data[0]
-        
-        if cmd == CMD_IDLE:
+        if cmd == JetCmd.IDLE:
             logger.info("🛑 JET STATUS: IDLE detected")
-            await self.system.on_jet_idle()
-            
-        elif cmd == CMD_PLATFORM_DETECTED:
-            logger.info("🧲 JET STATUS: Platform detected (magnet sensed)")
-            await self.system.on_platform_detected()
-            
-        elif cmd == CMD_RUNNING:
+            if self.system:
+                await self.system.on_jet_idle()
+        elif cmd == JetCmd.PLATFORM_DETECTED:
+            logger.info("🧲 JET STATUS: Platform detected")
+            if self.system:
+                await self.system.on_platform_detected()
+        elif cmd == JetCmd.RUNNING:
             logger.info("✈️  JET STATUS: Running/Moving")
-            await self.system.on_jet_running()
-    
+            if self.system:
+                await self.system.on_jet_running()
+        else:
+            logger.debug(f"{self.name}: Unknown control 0x{cmd:02X}")
+
     async def connect(self):
-        """Connect to the Jet Arduino"""
         try:
             logger.info(f"Connecting to {self.name} at {self.address}...")
-            self.client = BleakClient(self.address)
+            self.client = BleakClient(self.device, timeout=30.0)
             await self.client.connect()
-            self.connected = True
+            
+            if not self.client.is_connected:
+                raise Exception("Failed to establish connection")
+            
             logger.info(f"✓ Connected to {self.name}")
+            await asyncio.sleep(0.5)
             
-            # Start notifications for sensor data
-            await self.client.start_notify(JET_DATA_CHAR, self.notification_handler_data)
-            logger.info("✓ Subscribed to sensor data")
+            try:
+                await self.client.start_notify(JET_DATA_CHAR, self._notify_data_callback)
+                logger.info("✓ Subscribed to sensor data")
+            except Exception as e:
+                logger.warning(f"Could not subscribe to sensor data: {e}")
             
-            # Start notifications for control/status
-            await self.client.start_notify(JET_CONTROL_CHAR, self.notification_handler_control)
-            logger.info("✓ Subscribed to control/status")
+            try:
+                await self.client.start_notify(JET_CONTROL_CHAR, self._notify_control_callback)
+                logger.info("✓ Subscribed to control/status")
+            except Exception as e:
+                logger.warning(f"Could not subscribe to control: {e}")
+            
+            self.connected = True
             
         except Exception as e:
-            logger.error(f"Failed to connect to {self.name}: {e}")
             self.connected = False
-            
+            logger.error(f"{self.name}: Failed to connect - {e}")
+            raise
+
     async def disconnect(self):
-        """Disconnect from the Jet Arduino"""
         if self.client and self.connected:
             try:
                 await self.client.disconnect()
                 self.connected = False
                 logger.info(f"Disconnected from {self.name}")
-            except Exception as e:
-                logger.error(f"Error disconnecting from {self.name}: {e}")
-    
-    async def send_command(self, command):
-        """Send a command to the Jet"""
-        if self.client and self.connected:
-            try:
-                await self.client.write_gatt_char(JET_RX_CHAR, bytes([command]))
-                logger.debug(f"Sent command to Jet: 0x{command:02X}")
-            except Exception as e:
-                logger.error(f"Failed to send command to Jet: {e}")
+            except Exception:
+                logger.exception(f"{self.name}: Failed to disconnect")
 
+    def is_connected(self):
+        try:
+            return bool(self.client and self.client.is_connected)
+        except Exception:
+            return False
 
+# ----------------------------
+# Table Device
+# ----------------------------
 class TableDevice:
-    """Manages connection and communication with the Turning Table Arduino"""
-    
-    def __init__(self, address, system_controller):
+    def __init__(self, device, system_controller=None):
         self.name = TABLE_NAME
-        self.address = address
+        self.device = device
+        self.address = device.address
         self.client = None
         self.connected = False
         self.system = system_controller
-        
+        self._write_lock = asyncio.Lock()
+
+    def _notify_status_callback(self, sender, data):
+        asyncio.create_task(self.notification_handler_status(sender, data))
+
     async def notification_handler_status(self, sender, data):
-        """Handle status notifications from Table"""
+        if not data:
+            return
         status = data[0]
-        
-        if status == STATUS_MAGNET_ON:
-            logger.info("🧲 TABLE STATUS: Electromagnet activated")
-            
-        elif status == STATUS_MAGNET_OFF:
-            logger.info("🧲 TABLE STATUS: Electromagnet deactivated")
-            
-        elif status == STATUS_ROTATING:
-            logger.info("🔄 TABLE STATUS: Rotation started")
-            
-        elif status == STATUS_STOPPED:
-            logger.info("⏹️  TABLE STATUS: Rotation stopped")
-            
-        elif status == STATUS_READY:
+        if status == TableStatus.MAGNET_ON:
+            logger.info("🧲 TABLE STATUS: Magnet ON")
+        elif status == TableStatus.MAGNET_OFF:
+            logger.info("🧲 TABLE STATUS: Magnet OFF")
+        elif status == TableStatus.ROTATING:
+            logger.info("🔄 TABLE STATUS: Rotating")
+        elif status == TableStatus.STOPPED:
+            logger.info("⏹️  TABLE STATUS: Stopped")
+        elif status == TableStatus.READY:
             logger.info("✓ TABLE STATUS: Ready")
-    
+        else:
+            logger.debug(f"{self.name}: Unknown status 0x{status:02X}")
+
     async def connect(self):
-        """Connect to the Turning Table Arduino"""
         try:
             logger.info(f"Connecting to {self.name} at {self.address}...")
-            self.client = BleakClient(self.address)
+            self.client = BleakClient(self.device, timeout=30.0)
             await self.client.connect()
-            self.connected = True
-            logger.info(f"✓ Connected to {self.name}")
             
-            # Start notifications for status
-            await self.client.start_notify(TABLE_STATUS_CHAR, self.notification_handler_status)
-            logger.info("✓ Subscribed to table status")
+            if not self.client.is_connected:
+                raise Exception("Failed to establish connection")
+            
+            logger.info(f"✓ Connected to {self.name}")
+            await asyncio.sleep(0.5)
+            
+            try:
+                await self.client.start_notify(TABLE_STATUS_CHAR, self._notify_status_callback)
+                logger.info("✓ Subscribed to table status")
+            except Exception as e:
+                logger.warning(f"Could not subscribe to status: {e}")
+            
+            self.connected = True
             
         except Exception as e:
-            logger.error(f"Failed to connect to {self.name}: {e}")
             self.connected = False
-            
+            logger.error(f"{self.name}: Failed to connect - {e}")
+            raise
+
     async def disconnect(self):
-        """Disconnect from the Turning Table Arduino"""
         if self.client and self.connected:
             try:
                 await self.client.disconnect()
                 self.connected = False
                 logger.info(f"Disconnected from {self.name}")
-            except Exception as e:
-                logger.error(f"Error disconnecting from {self.name}: {e}")
-    
+            except Exception:
+                logger.exception(f"{self.name}: Failed to disconnect")
+
+    def is_connected(self):
+        try:
+            return bool(self.client and self.client.is_connected)
+        except Exception:
+            return False
+
     async def send_command(self, command):
-        """Send a command to the Table"""
-        if self.client and self.connected:
+        if not self.is_connected():
+            logger.warning(f"{self.name}: Cannot send command - not connected")
+            return False
+        async with self._write_lock:
             try:
                 await self.client.write_gatt_char(TABLE_COMMAND_CHAR, bytes([command]))
-                logger.debug(f"Sent command to Table: 0x{command:02X}")
-            except Exception as e:
-                logger.error(f"Failed to send command to Table: {e}")
-    
+                await asyncio.sleep(0.1)  # Small delay for command processing
+                return True
+            except Exception:
+                logger.exception(f"{self.name}: Failed to send 0x{command:02X}")
+                return False
+
     async def activate_magnet(self):
-        """Activate the electromagnet"""
-        logger.info("→ Activating electromagnet on turning table...")
-        await self.send_command(CMD_ACTIVATE_MAGNET)
-    
+        logger.info("→ Activating magnet")
+        return await self.send_command(TableCmd.ACTIVATE_MAGNET)
+
     async def deactivate_magnet(self):
-        """Deactivate the electromagnet"""
-        logger.info("→ Deactivating electromagnet on turning table...")
-        await self.send_command(CMD_DEACTIVATE_MAGNET)
-    
+        logger.info("→ Deactivating magnet")
+        return await self.send_command(TableCmd.DEACTIVATE_MAGNET)
+
     async def start_rotation(self):
-        """Start rotation"""
-        logger.info("→ Starting table rotation...")
-        await self.send_command(CMD_START_ROTATION)
-    
+        logger.info("→ Starting rotation")
+        return await self.send_command(TableCmd.START_ROTATION)
+
     async def stop_rotation(self):
-        """Stop rotation"""
-        logger.info("→ Stopping table rotation...")
-        await self.send_command(CMD_STOP_ROTATION)
+        logger.info("→ Stopping rotation")
+        return await self.send_command(TableCmd.STOP_ROTATION)
 
-
+# ----------------------------
+# System Controller
+# ----------------------------
 class SystemController:
-    """Main system controller managing the workflow between Jet and Table"""
-    
     def __init__(self, jet, table):
         self.jet = jet
         self.table = table
         self.state = SystemState.DISCONNECTED
-        self.rotation_duration = 10.0  # seconds for one complete scan
-        
+        self.rotation_duration = 10.0
+        self._state_lock = asyncio.Lock()
+        self._workflow_active = False
+
     async def on_jet_idle(self):
-        """Handle Jet entering IDLE state"""
-        if self.state == SystemState.JET_RUNNING:
+        async with self._state_lock:
+            if self.state != SystemState.JET_RUNNING or self._workflow_active:
+                return
+            
             logger.info("\n" + "="*60)
-            logger.info("🔄 WORKFLOW: Jet is IDLE - Activating magnet on table")
+            logger.info("🔄 WORKFLOW: Jet IDLE → Activating magnet")
             logger.info("="*60 + "\n")
             
+            self._workflow_active = True
             self.state = SystemState.JET_IDLE
             
-            # Activate electromagnet on turning table
-            await self.table.activate_magnet()
-            self.state = SystemState.MAGNET_ACTIVATING
+            success = await self.table.activate_magnet()
             
-            # Wait for magnet to fully activate
-            await asyncio.sleep(0.5)
 
-            # Deactivate magnet
-            await self.table.deactivate_magnet()
-            self.state = SystemState.MAGNET_DEACTIVATING
+            if not success:
+                logger.error("Failed to activate magnet - resetting workflow")
+                self._workflow_active = False
+                self.state = SystemState.JET_RUNNING
+                return
             
+            await asyncio.sleep(1.0)
             self.state = SystemState.WAITING_FOR_PLATFORM
-            logger.info("⏳ Waiting for jet to detect platform magnet...")
-    
+            logger.info("⏳ Waiting for platform detection...")
+
+            await asyncio.sleep(0.5)
+            await self.table.deactivate_magnet()
+
     async def on_platform_detected(self):
-        """Handle Jet detecting the platform"""
-        if self.state == SystemState.WAITING_FOR_PLATFORM:
+        async with self._state_lock:
+            if self.state != SystemState.WAITING_FOR_PLATFORM:
+                logger.debug(f"Platform detected but wrong state: {self.state}")
+                return
+            
             logger.info("\n" + "="*60)
-            logger.info("🎯 WORKFLOW: Platform detected - Starting rotation sequence")
+            logger.info("🎯 WORKFLOW: Platform detected → Starting rotation")
             logger.info("="*60 + "\n")
             
             self.state = SystemState.PLATFORM_DETECTED
-            
-            # Confirm to Jet that table received the signal
-            await self.jet.send_command(0x10)
-            
-            # Small delay for stability
             await asyncio.sleep(1.0)
             
-            # Start rotation
-            await self.table.start_rotation()
+            success = await self.table.start_rotation()
+            if not success:
+                logger.error("Failed to start rotation - aborting workflow")
+                await self._abort_workflow()
+                return
+            
             self.state = SystemState.ROTATING
             
-            # logger.info(f"🔄 Rotating for {self.rotation_duration} seconds...")
+            logger.info(f"🔄 Rotating for {self.rotation_duration} seconds...")
+            await asyncio.sleep(self.rotation_duration)
             
-            # Rotate for specified duration
-            # await asyncio.sleep(self.rotation_duration)
-            
-            # Stop rotation
-            # await self.table.stop_rotation()
-            # await asyncio.sleep(0.5)
-            
-            
-            # self.state = SystemState.ROTATION_COMPLETE
-            
-            # logger.info("\n" + "="*60)
-            # logger.info("✅ WORKFLOW COMPLETE: Rotation finished, magnet off")
-            # logger.info("="*60 + "\n")
-            
-            # Return to waiting state
-            # self.state = SystemState.JET_RUNNING
-    
+            await self._complete_workflow()
+
     async def on_jet_running(self):
-        """Handle Jet returning to RUNNING state"""
-        if self.state in [SystemState.ROTATION_COMPLETE, SystemState.PLATFORM_DETECTED]:
-            logger.info("✈️  Jet removed from platform or moving again")
-            
-            # Safety: ensure magnet is off and rotation stopped
-            await self.table.deactivate_magnet()
-            await self.table.stop_rotation()
-            
-            self.state = SystemState.JET_RUNNING
+        async with self._state_lock:
+            if self.state in [SystemState.ROTATING, SystemState.PLATFORM_DETECTED, 
+                             SystemState.WAITING_FOR_PLATFORM, SystemState.JET_IDLE]:
+                logger.info("✈️  Jet moved → stopping workflow")
+                await self._abort_workflow()
 
+    async def _complete_workflow(self):
+        """Complete the rotation workflow cleanly"""
+        await self.table.stop_rotation()
+        await asyncio.sleep(0.3)
+        await self.table.deactivate_magnet()
+        
+        logger.info("\n" + "="*60)
+        logger.info("✅ WORKFLOW COMPLETE")
+        logger.info("="*60 + "\n")
+        
+        self.state = SystemState.JET_RUNNING
+        self._workflow_active = False
 
-async def scan_for_devices():
-    """Scan for both Arduino devices"""
-    logger.info("🔍 Scanning for devices...")
-    devices = await BleakScanner.discover(timeout=10.0)
+    async def _abort_workflow(self):
+        """Abort workflow and return to safe state"""
+        await self.table.stop_rotation()
+        await asyncio.sleep(0.2)
+        await self.table.deactivate_magnet()
+        
+        logger.info("⚠️  Workflow aborted - returning to normal operation")
+        self.state = SystemState.JET_RUNNING
+        self._workflow_active = False
+
+# ----------------------------
+# BLE Scan & Main
+# ----------------------------
+async def scan_for_devices(timeout=15.0):
+    """Scan once and return device objects"""
+    logger.info(f"🔍 Scanning for devices ({timeout}s)...")
     
-    found_devices = {}
-    for device in devices:
-        if device.name == JET_NAME:
-            found_devices[JET_NAME] = device.address
-            logger.info(f"✓ Found {JET_NAME} at {device.address}")
-        elif device.name == TABLE_NAME:
-            found_devices[TABLE_NAME] = device.address
-            logger.info(f"✓ Found {TABLE_NAME} at {device.address}")
+    scanner = BleakScanner()
+    devices = await scanner.discover(timeout=timeout)
     
-    return found_devices
-
+    found = {}
+    for d in devices:
+        name = d.name or ""
+        if name == JET_NAME:
+            found[JET_NAME] = d
+            logger.info(f"✓ Found {JET_NAME} at {d.address}")
+        elif name == TABLE_NAME:
+            found[TABLE_NAME] = d
+            logger.info(f"✓ Found {TABLE_NAME} at {d.address}")
+    
+    return found
 
 async def main():
-    """Main function"""
-    
     logger.info("\n" + "="*60)
     logger.info("Raspberry Pi BLE Central Control System")
-    logger.info("Jet ↔ Raspberry Pi ↔ Turning Table")
     logger.info("="*60 + "\n")
     
     # Scan for devices
-    found_devices = await scan_for_devices()
+    found = await scan_for_devices()
     
-    if JET_NAME not in found_devices:
-        logger.error(f"❌ Could not find {JET_NAME}!")
+    if JET_NAME not in found:
+        logger.error(f"❌ {JET_NAME} not found!")
         return
-    
-    if TABLE_NAME not in found_devices:
-        logger.error(f"❌ Could not find {TABLE_NAME}!")
+    if TABLE_NAME not in found:
+        logger.error(f"❌ {TABLE_NAME} not found!")
         return
-    
-    # Create system controller first (needed for device initialization)
-    system = None
-    
+
     # Create device objects
-    jet = JetDevice(found_devices[JET_NAME], system)
-    table = TableDevice(found_devices[TABLE_NAME], system)
-    
-    # Now create system controller with devices
+    jet = JetDevice(found[JET_NAME])
+    table = TableDevice(found[TABLE_NAME])
     system = SystemController(jet, table)
     jet.system = system
     table.system = system
-    
+
     try:
-        # Connect to both devices in parallel
-        logger.info("\n📡 Connecting to devices...")
-        await asyncio.gather(
-            jet.connect(),
-            table.connect()
-        )
+        # Connect to both devices
+        logger.info("\n📡 Connecting to devices...\n")
         
-        if not jet.connected or not table.connected:
-            logger.error("❌ Failed to connect to one or both devices")
+        try:
+            await jet.connect()
+        except Exception as e:
+            logger.error(f"Failed to connect to Jet: {e}")
             return
         
-        logger.info("\n" + "="*60)
-        logger.info("✅ System Ready - Monitoring for events")
-        logger.info("="*60)
-        logger.info("Workflow: IDLE → Magnet ON → Platform Detection → Rotation")
-        logger.info("Press Ctrl+C to stop\n")
+        await asyncio.sleep(2.0)
         
+        try:
+            await table.connect()
+        except Exception as e:
+            logger.error(f"Failed to connect to Table: {e}")
+            await jet.disconnect()
+            return
+        
+        if not jet.connected or not table.connected:
+            logger.error("❌ Failed to establish all connections")
+            return
+
         system.state = SystemState.JET_RUNNING
         
-        # Keep the connection alive and monitor
+        logger.info("\n" + "="*60)
+        logger.info("✅ System Ready")
+        logger.info("="*60)
+        logger.info("Workflow: IDLE → Magnet → Platform → Rotation")
+        logger.info("Press Ctrl+C to stop\n")
+
+        # Monitor connections
         while True:
-            await asyncio.sleep(1)
-            
-            # Check if devices are still connected
-            if not jet.connected or not table.connected:
-                logger.warning("⚠️  Connection lost to one or both devices")
+            await asyncio.sleep(1.0)
+            if not jet.is_connected() or not table.is_connected():
+                logger.warning("⚠️  Connection lost")
                 break
-        
+                
     except KeyboardInterrupt:
-        logger.info("\n\n🛑 Shutting down...")
-        
-        # Safety: stop everything
-        try:
-            await table.stop_rotation()
-            await table.deactivate_magnet()
-        except:
-            pass
-            
+        logger.info("\n🛑 Shutting down...")
+        await table.stop_rotation()
+        await table.deactivate_magnet()
     except Exception as e:
-        logger.error(f"❌ Error in main loop: {e}", exc_info=True)
-        
+        logger.error(f"❌ Error: {e}", exc_info=True)
     finally:
-        # Disconnect from both devices
-        logger.info("Disconnecting devices...")
-        await asyncio.gather(
-            jet.disconnect(),
-            table.disconnect()
-        )
+        await jet.disconnect()
+        await table.disconnect()
         logger.info("✓ Shutdown complete")
 
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("\nExiting...")
+    asyncio.run(main())
