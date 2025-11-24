@@ -2,27 +2,19 @@
 #include "RotationManager.h"
 #include "SmoothData4D.h"
 
-#define FREQUENCY 25.0f
-#define MAG_FREQUENCY 19.0f
+#define FREQUENCY 25.0f // Hz       Frequenz mit der Sensrodaten gemessen/gesendet werden
+#define MAG_FREQUENCY 19.0f // Hz   Frequenz für Magnetometer Kalibrierung
 
-// BLE Command Bytes
-const uint8_t CMD_RUNNING = 0x00;
-const uint8_t CMD_IDLE = 0x01;
-const uint8_t CMD_PLATFORM_DETECTED = 0x02;
-const uint8_t CMD_CALIBRATE_MAG = 0x03;
+#define CMD_RUNNING 0x00          // Jet bewegt sich und sendet Daten
+#define CMD_IDLE 0x01             // Jet geht in den IDLE Mode
+#define CMD_PLATFORM_DETECTED 0x02  // Jet war im IDLE und hat detected, dass er auf der Plattform steht
+#define CMD_CALIBRATE_MAG 0x03    // Jet geht in den Kalibrierungsmodus
 
-// Thresholds for idle detection
-const float ACCEL_IDLE_THRESHOLD = 0.03f;
-const float GYRO_IDLE_THRESHOLD = 10.0f;
-const int IDLE_COUNT_MAX = 100;
+#define CALIB_START_MAG_CALIBRATION 0x30  // Start sending mag data for calibration
+#define CALIB_STOP_MAG_CALIBRATION 0x31   // Stop sending mag data for calibration
+#define CALIB_SEND_CALIBRATION_MATRIX 0x32 // Receive calibration matrix
 
-// Thresholds for platform detection (magnetometer)
-const float MAG_BASELINE = 48.0f;
-const float MAG_DETECT_THRESHOLD = 25.0f;
-
-// Threshold for movement detection from platform
-const float PLATFORM_ACCEL_THRESHOLD = 0.05f;
-const float PLATFORM_GYRO_THRESHOLD = 200.0f;
+uint8_t cmd;
 
 enum State {
   RUNNING,
@@ -33,163 +25,231 @@ enum State {
 };
 
 State currentState = DISCONNECTED;
-State previousState = DISCONNECTED;
 
-// Sensor data structure
+// Single Sensor Sample (32 Bytes)
 struct SensorValues {
-  uint32_t timestamp_ms;
-  float accelX, accelY, accelZ;
-  float q0, q1, q2, q3;
-  float magX, magY, magZ;
-  float tempC;
+  uint32_t timestamp_ms;        // in ms
+  float accelX, accelY, accelZ; // in m/s
+  float q0, q1, q2, q3;         // in Grad
+  float magX, magY, magZ;       // in Tesla    
+  float tempC;                  // in Celsius
 } __attribute__((packed));
 
+// Sendet nur Magnetometer Daten für Kalibrierung
 struct MagnoValues {
-  float mx, my, mz;
+  float mx, my, mz;             // in Tesla    
 } __attribute__((packed));
 
-// Globals
+// === Globals === 
 SensorValues sensorData;
 MagnoValues magValues;
-unsigned long lastSendTime = 0;
-unsigned long lastStateChangeTime = 0;
+unsigned long lastSendTime;
 float tempC;
 int idlecount = 0;
-float accelMag = 0.0f;
-float magnetMag = 0.0f;
-float gyroMag = 0.0f;
+static const int idleCountMax = 100;
+bool idle = false;
+bool calibrating = false;
 
-// BLE Service
+// Calibration matrix (3x3, stored as 9 floats)
+float calibrationMatrix[3][3] = {
+  {1.0, 0.0, 0.0},
+  {0.0, 1.0, 0.0},
+  {0.0, 0.0, 1.0}
+};
+ 
+// BLE Service erstellen
 BLEService myService("19B10000-E8F2-537E-4F6C-D104768A1214");
 
-// Sensor objects
+// === SensorManager ===
 RotationManager sensor;
 Quaternion _Quaternion;
 float ax = 0, ay = 0, az = 0;
 float mx = 0, my = 0, mz = 0;
 
-// Smoothing
-SmoothQuaternionData smoothing;
+// === SmoothData4D ===
+SmoothQuaternionData smoothing;  
 
-// BLE Characteristics
+// === BLE Characteristics ===
 BLECharacteristic dataCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1214",
-                                   BLERead | BLENotify, sizeof(SensorValues));
+                                   BLERead | BLEWrite | BLENotify, sizeof(SensorValues));
 
 BLECharacteristic magCharacteristic("19B10002-E8F2-537E-4F6C-D104768A1214",
                                    BLERead | BLENotify, sizeof(MagnoValues));
 
-BLECharacteristic controlCharacteristic("19B10003-E8F2-537E-4F6C-D104768A1214",
-                                   BLERead | BLENotify, 1);
+BLECharacteristic statusCharacteristic("19B10003-E8F2-537E-4F6C-D104768A1214",
+                                   BLERead | BLEWrite | BLENotify, 1);
 
+BLECharacteristic commandCharacteristic("19B10004-E8F2-537E-4F6C-D104768A1214",
+                                   BLEWrite, 1);
+ 
 void setup() {
   Serial.begin(115200);
-
+  // while (!Serial);
+ 
   // Initialize BLE
   if (!BLE.begin()) {
     Serial.println("Starting BLE failed!");
     while (1);
   }
-
+ 
   BLE.setConnectionInterval(6, 6);
   BLE.setAdvertisingInterval(160);
   BLE.setLocalName("Eurofighter");
   BLE.setDeviceName("Eurofighter");
-
+ 
   BLE.setAdvertisedService(myService);
-
+ 
   myService.addCharacteristic(dataCharacteristic);
   myService.addCharacteristic(magCharacteristic);
-  myService.addCharacteristic(controlCharacteristic);
-
+  myService.addCharacteristic(statusCharacteristic);
+  myService.addCharacteristic(commandCharacteristic);
+ 
   BLE.addService(myService);
-
-  // Start advertising
+ 
+  dataCharacteristic.writeValue("Ready");
+  
+  // Set event handler for incoming commands/calibration data
+  commandCharacteristic.setEventHandler(BLEWritten, commandCharacteristicReceived);
+ 
   BLE.advertise();
-
-  Serial.println("Eurofighter ready, waiting for connections...");
+ 
+  Serial.println("Bluetooth device active, waiting for connections...");
 
   sensor.init(FREQUENCY);
-  smoothing.initSmoothing(FREQUENCY, 0.7f);
-
-  lastStateChangeTime = millis();
+  smoothing.initSmoothing(FREQUENCY, 0.6f);
 }
 
-void changeState(State newState) {
-  if(currentState != newState) {
-    previousState = currentState;
-    currentState = newState;
-    lastStateChangeTime = millis();
-    
-    if(Serial) {
-      Serial.print("State: ");
-      switch(newState) {
-        case RUNNING: Serial.println("RUNNING"); break;
-        case CALIBRATING: Serial.println("CALIBRATING"); break;
-        case DISCONNECTED: Serial.println("DISCONNECTED"); break;
-        case IDLE: Serial.println("IDLE"); break;
-        case PLATFORM: Serial.println("PLATFORM"); break;
-      }
-    }
-  }
-}
-
-void sendControlCommand(uint8_t cmd) {
-  controlCharacteristic.writeValue(&cmd, 1);
+void commandCharacteristicReceived(BLEDevice central, BLECharacteristic characteristic) {
+  uint8_t* data = (uint8_t*)commandCharacteristic.value();
+  uint8_t dataLen = commandCharacteristic.valueLength();
+  
+  if(dataLen < 1) return;
+  
+  uint8_t receivedCmd = data[0];
+  
   if(Serial) {
-    Serial.print("→ Sent control: 0x");
-    Serial.println(cmd, HEX);
+    Serial.print("Received command: 0x");
+    Serial.println(receivedCmd, HEX);
+  }
+  
+  switch(receivedCmd) {
+    // === Calibration Commands ===
+    case CALIB_START_MAG_CALIBRATION:
+      if(Serial) Serial.println("→ Starting magnetometer calibration mode");
+      calibrating = true;
+      break;
+      
+    case CALIB_STOP_MAG_CALIBRATION:
+      if(Serial) Serial.println("→ Stopping magnetometer calibration mode");
+      calibrating = false;
+      break;
+      
+    case CALIB_SEND_CALIBRATION_MATRIX:
+      // Receive calibration matrix (3x3 = 9 floats = 36 bytes)
+      if(dataLen >= 37) { // 1 byte cmd + 36 bytes matrix
+        if(Serial) Serial.println("→ Receiving calibration matrix...");
+        
+        // Extract calibration matrix from data
+        float* matrixPtr = (float*)&data[1];
+        for(int i = 0; i < 3; i++) {
+          for(int j = 0; j < 3; j++) {
+            calibrationMatrix[i][j] = matrixPtr[i * 3 + j];
+          }
+        }
+        
+        if(Serial) {
+          Serial.println("✓ Calibration matrix received and stored:");
+          for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) {
+              Serial.print(calibrationMatrix[i][j]);
+              Serial.print("\t");
+            }
+            Serial.println();
+          }
+        }
+      }
+      break;
+      
+    // === Table Feedback Commands ===
+    case 0x10: // Magnet activated
+      if(Serial) Serial.println("Turning table magnet activated");
+      break;
+    case 0x11: // Magnet deactivated
+      if(Serial) Serial.println("Turning table magnet deactivated");
+      break;
+    case 0x12: // Rotation started
+      if(Serial) Serial.println("Turning table rotation started");
+      break;
+    case 0x13: // Rotation stopped
+      if(Serial) Serial.println("Turning table rotation stopped");
+      break;
   }
 }
-
+ 
 void loop() {
   BLEDevice central = BLE.central();
   BLE.poll();
 
-  // Connection state management
-  if(currentState != DISCONNECTED && (!central || !central.connected())) {
-    changeState(DISCONNECTED);
-    idlecount = 0;
-  }
-
   switch(currentState) {
-    // ===== DISCONNECTED =====
+    // ==== RECONNECTING STATE ====
     case DISCONNECTED:
       if (central && central.connected()) {
-        if(Serial) {
-          Serial.print("✓ Connected to central: ");
-          Serial.println(central.address());
-        }
-        changeState(RUNNING);
+        if(Serial) Serial.print("Connected to central: ");
+        if(Serial) Serial.println(central.address());
+        currentState = RUNNING;
         lastSendTime = millis();
-        idlecount = 0;
       }
       break;
-
-    // ===== MAGNETOMETER CALIBRATION =====
+    
+    // ==== MAGNETOMETER KALIBRIERUNG ====
     case CALIBRATING:
-      if(millis() - lastSendTime < 1000 / MAG_FREQUENCY) break;
-      if(!central.connected()) break;
-      if(!IMU.magneticFieldAvailable()) break;
-
+      if(!(millis() - lastSendTime >= 1000 / MAG_FREQUENCY)) {
+        break;
+      }
+      if(central.connected() == false) {
+        break;
+      } 
+      if(!IMU.magneticFieldAvailable()) {
+        break;
+      }
       lastSendTime = millis();
       IMU.readMagneticField(mx, my, mz);
       magValues = {mx, my, mz};
+      // Send magnetometer data
       magCharacteristic.writeValue((byte*)&magValues, sizeof(float)*3);
       break;
 
-    // ===== RUNNING (MAIN LOOP) =====
+    // =====================
+    // ===== MAIN LOOP =====
+    // =====================
     case RUNNING:
-      if(!central.connected()) break;
-      if(millis() - lastSendTime < 1000 / FREQUENCY) break;
-
-      lastSendTime = millis();
+      if(central.connected() == false) {
+        if(Serial) Serial.print("Disconnected from central: ");
+        if(Serial) Serial.println(central.address());
+        currentState = DISCONNECTED;
+        idlecount = 0;
+        calibrating = false;
+        break;
+      }
       
-      // Get sensor data
+      // Check if calibration was requested
+      if(calibrating) {
+        currentState = CALIBRATING;
+        lastSendTime = millis();
+        if(Serial) Serial.println("State: CALIBRATING");
+        break;
+      }
+      
+      if(!(millis() - lastSendTime >= 1000 / FREQUENCY)) {
+        break;
+      }
+      
+      float gyroMag;
+      lastSendTime = millis();
       sensor.getCalculatedData(_Quaternion, ax, ay, az, mx, my, mz, gyroMag);
       sensor.getTemperature(tempC);
-      smoothing.smoothQuaternion(_Quaternion, millis());
 
-      // Fill and send sensor data
+      // SensorData Struct mit aktuellen Werten füllen
       sensorData.timestamp_ms = millis();
       sensorData.accelX = ax;
       sensorData.accelY = ay;
@@ -205,62 +265,62 @@ void loop() {
       
       dataCharacteristic.writeValue((byte*)&sensorData, sizeof(sensorData));
 
-      // IDLE detection
-      accelMag = sqrt(ax*ax + ay*ay + (az-1)*(az-1));
-      if(accelMag < ACCEL_IDLE_THRESHOLD && gyroMag < GYRO_IDLE_THRESHOLD) {
+      // IDLE Detection
+      float accelMag = sqrt(ax*ax + ay*ay + (az-1)*(az-1));
+      if(accelMag < 0.03f && gyroMag < 10.0f) {
         idlecount++;
-        if(idlecount > IDLE_COUNT_MAX) {
-          changeState(IDLE);
-          sendControlCommand(CMD_IDLE);
-          idlecount = 0;
+        if(idlecount > idleCountMax){
+          currentState = IDLE;
+          if(Serial) Serial.println("State: IDLE");
         }
       } else {
         idlecount = 0;
       }
       break;
 
-    // ===== IDLE =====
     case IDLE:
-      if(!central.connected()) break;
-
-      // Get current sensor readings
-      sensor.getCalculatedData(_Quaternion, ax, ay, az, mx, my, mz, gyroMag);
-      accelMag = sqrt(ax*ax + ay*ay + az*az);
-      magnetMag = sqrt(mx*mx + my*my + mz*mz);
-
-      // Movement detection -> back to RUNNING
-      if(abs(accelMag - 1.0f) > ACCEL_IDLE_THRESHOLD || gyroMag > GYRO_IDLE_THRESHOLD) {
-        changeState(RUNNING);
-        sendControlCommand(CMD_RUNNING);
-        idlecount = 0;
-        break;
+      if(!idle){ 
+        statusCharacteristic.writeValue(&CMD_IDLE, 1);
+        idle = true;
+        if(Serial) Serial.println("Sent: CMD_IDLE");
       }
 
-      // Platform detection (strong magnetic field)
-      if(abs(magnetMag - MAG_BASELINE) > MAG_DETECT_THRESHOLD) {
-        changeState(PLATFORM);
-        sendControlCommand(CMD_PLATFORM_DETECTED);
+      sensor.getCalculatedData(_Quaternion, ax, ay, az, mx, my, mz, gyroMag);
+      float accelMag = sqrt(ax*ax + ay*ay + az*az);
+      float magnetMag = sqrt(mx*mx + my*my + mz*mz);
+
+      if((accelMag - 1) > 0.15f || gyroMag > 10.0f){
+        cmd = CMD_RUNNING;
+        statusCharacteristic.writeValue(&cmd, 1);
+        idle = false;
+        idlecount = 0;
+        currentState = RUNNING;
+        if(Serial) Serial.println("State: RUNNING (movement detected)");
+      }
+
+      if((magnetMag - 48) > 25){
+        cmd = CMD_PLATFORM_DETECTED;
+        statusCharacteristic.writeValue(&cmd, 1);
+        currentState = PLATFORM;
+        if(Serial) Serial.println("State: PLATFORM (magnet detected)");
         if(Serial) {
-          Serial.print("Platform detected! Mag: ");
+          Serial.print("Magnetic field magnitude: ");
           Serial.println(magnetMag);
         }
       }
       break;
 
-    // ===== PLATFORM =====
     case PLATFORM:
-      if(!central.connected()) break;
-
-      // Monitor for pickup/movement
       sensor.getCalculatedData(_Quaternion, ax, ay, az, mx, my, mz, gyroMag);
       accelMag = sqrt(ax*ax + ay*ay + az*az);
-
-      // Stronger thresholds for platform detection
-      if(abs(accelMag - 1.0f) > PLATFORM_ACCEL_THRESHOLD || gyroMag > PLATFORM_GYRO_THRESHOLD) {
-        changeState(RUNNING);
-        sendControlCommand(CMD_RUNNING);
+      
+      if((accelMag - 1) > 0.2f || gyroMag > 15.0f){
+        cmd = CMD_RUNNING;
+        statusCharacteristic.writeValue(&cmd, 1);
+        idle = false;
         idlecount = 0;
-        if(Serial) Serial.println("Movement detected - leaving platform");
+        currentState = RUNNING;
+        if(Serial) Serial.println("State: RUNNING (jet removed from platform)");
       }
       break;
   }
