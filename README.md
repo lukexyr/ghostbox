@@ -876,7 +876,7 @@ This function is triggered when the Jet sends an IDLE notification. The workflow
                 return
             
             logger.info("\n" + "="*60)
-            logger.info("🎯 WORKFLOW: Platform detected → Starting rotation")
+            logger.info("WORKFLOW: Platform detected → Starting rotation")
             logger.info("="*60 + "\n")
             
             self.state = SystemState.PLATFORM_DETECTED
@@ -931,7 +931,7 @@ When the button is pressed for 2 seconds on the turning table, it triggers calib
                 return
             
             logger.info("\n" + "="*60)
-            logger.info("🔧 CALIBRATION: Starting magnetometer calibration")
+            logger.info("CALIBRATION: Starting magnetometer calibration")
             logger.info("="*60 + "\n")
             
             self._calibration_active = True
