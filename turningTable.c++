@@ -1,24 +1,31 @@
 #include <ArduinoBLE.h>
 
 // Pin definitions
-#define ELECTROMAGNET_PIN 2
-#define MOTOR_ENABLE_PIN 3
-#define MOTOR_DIR_PIN 4
-#define MOTOR_STEP_PIN 5
+#define ELECTROMAGNET_PIN 2       // Pin für Elektromagnet Relais
+#define MOTOR_ENABLE_PIN 3        // Pin für Motor Enable
+#define MOTOR_DIR_PIN 4           // Pin für Motor Direction
+#define MOTOR_STEP_PIN 5          // Pin für Motor Step
+#define CALIBRATION_BUTTON_PIN 6  // Pin für Kalibrierungsbutton
+
+// Button press detection
+#define BUTTON_HOLD_TIME 2000   // milliseconds - hold time to trigger calibration
 
 // Commands from Raspberry Pi
-const uint8_t CMD_ACTIVATE_MAGNET = 0x10;
-const uint8_t CMD_DEACTIVATE_MAGNET = 0x11;
-const uint8_t CMD_START_ROTATION = 0x12;
-const uint8_t CMD_STOP_ROTATION = 0x13;
-const uint8_t CMD_SET_SPEED = 0x14;
+#define CMD_ACTIVATE_MAGNET 0x10    // Elektromagnet aktivieren
+#define CMD_DEACTIVATE_MAGNET 0x11  // Elektromagnet deaktivieren
+#define CMD_START_ROTATION 0x12     // Rotation starten
+#define CMD_STOP_ROTATION 0x13      // Rotation stoppen
 
 // Status commands to send
-const uint8_t STATUS_MAGNET_ON = 0x20;
-const uint8_t STATUS_MAGNET_OFF = 0x21;
-const uint8_t STATUS_ROTATING = 0x22;
-const uint8_t STATUS_STOPPED = 0x23;
-const uint8_t STATUS_READY = 0x24;
+#define STATUS_MAGNET_ON 0x20
+#define STATUS_MAGNET_OFF 0x21
+#define STATUS_ROTATING 0x22
+#define STATUS_STOPPED 0x23
+#define STATUS_READY 0x24
+
+// Button notification
+#define BUTTON_PRESSED 0x01
+#define BUTTON_RELEASED 0x00
 
 enum TableState {
   DISCONNECTED,
@@ -39,29 +46,38 @@ BLECharacteristic statusCharacteristic("19B20001-E8F2-537E-4F6C-D104768A1215",
 BLECharacteristic commandCharacteristic("19B20002-E8F2-537E-4F6C-D104768A1215",
                                         BLEWrite, 1);
 
+BLECharacteristic buttonCharacteristic("19B20003-E8F2-537E-4F6C-D104768A1215",
+                                       BLERead | BLENotify, 1);
+
 // Rotation parameters
 bool magnetActive = false;
 bool isRotating = false;
 unsigned long rotationStartTime = 0;
-int rotationSpeed = 50;
+int rotationSpeed = 50; // Default speed (0-100)
 unsigned long lastStepTime = 0;
-int stepDelay = 1000;
+int stepDelay = 1000; // Microseconds between steps
+
+// Button handling
+unsigned long buttonPressStartTime = 0;
+bool buttonPressed = false;
+bool calibrationTriggered = false;
 
 void setup() {
   Serial.begin(115200);
+  // while (!Serial);
 
   // Configure pins
   pinMode(ELECTROMAGNET_PIN, OUTPUT);
   pinMode(MOTOR_ENABLE_PIN, OUTPUT);
   pinMode(MOTOR_DIR_PIN, OUTPUT);
   pinMode(MOTOR_STEP_PIN, OUTPUT);
+  pinMode(CALIBRATION_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
 
   // Initial states
   digitalWrite(ELECTROMAGNET_PIN, LOW);
   digitalWrite(MOTOR_ENABLE_PIN, LOW);
   digitalWrite(MOTOR_DIR_PIN, HIGH);
-  digitalWrite(MOTOR_STEP_PIN, LOW);
 
   // Initialize BLE
   if (!BLE.begin()) {
@@ -78,10 +94,11 @@ void setup() {
 
   tableService.addCharacteristic(statusCharacteristic);
   tableService.addCharacteristic(commandCharacteristic);
+  tableService.addCharacteristic(buttonCharacteristic);
 
   BLE.addService(tableService);
 
-  // Set event handler
+  // Set event handlers
   commandCharacteristic.setEventHandler(BLEWritten, onCommandReceived);
 
   // Start advertising
@@ -114,17 +131,6 @@ void onCommandReceived(BLEDevice central, BLECharacteristic characteristic) {
     case CMD_STOP_ROTATION:
       stopRotation();
       break;
-      
-    case CMD_SET_SPEED:
-      // Speed value could be sent in multi-byte command
-      break;
-      
-    default:
-      if(Serial) {
-        Serial.print("Unknown command: 0x");
-        Serial.println(cmd, HEX);
-      }
-      break;
   }
 }
 
@@ -133,17 +139,12 @@ void activateMagnet() {
     digitalWrite(ELECTROMAGNET_PIN, HIGH);
     digitalWrite(LED_BUILTIN, HIGH);
     magnetActive = true;
-    
-    if(!isRotating) {
-      currentState = MAGNET_ACTIVE;
-    }
+    currentState = MAGNET_ACTIVE;
     
     uint8_t status = STATUS_MAGNET_ON;
     statusCharacteristic.writeValue(&status, 1);
     
-    if(Serial) Serial.println("→ Electromagnet activated");
-  } else {
-    if(Serial) Serial.println("⚠ Magnet already active");
+    if(Serial) Serial.println("Electromagnet activated");
   }
 }
 
@@ -160,15 +161,13 @@ void deactivateMagnet() {
     uint8_t status = STATUS_MAGNET_OFF;
     statusCharacteristic.writeValue(&status, 1);
     
-    if(Serial) Serial.println("→ Electromagnet deactivated");
-  } else {
-    if(Serial) Serial.println("⚠ Magnet already inactive");
+    if(Serial) Serial.println("Electromagnet deactivated");
   }
 }
 
 void startRotation() {
   if(!isRotating) {
-    digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+    digitalWrite(MOTOR_ENABLE_PIN, LOW);
     isRotating = true;
     rotationStartTime = millis();
     lastStepTime = micros();
@@ -181,15 +180,13 @@ void startRotation() {
     statusCharacteristic.writeValue(&status, 1);
     
     if(Serial) {
-      Serial.println("→ Rotation started");
-      Serial.print("  Speed: ");
+      Serial.println("Rotation started");
+      Serial.print("Speed: ");
       Serial.print(rotationSpeed);
       Serial.print("%, Step delay: ");
       Serial.print(stepDelay);
       Serial.println(" us");
     }
-  } else {
-    if(Serial) Serial.println("⚠ Already rotating");
   }
 }
 
@@ -199,23 +196,16 @@ void stopRotation() {
     digitalWrite(MOTOR_STEP_PIN, LOW);
     isRotating = false;
     
-    if(magnetActive) {
-      currentState = MAGNET_ACTIVE;
-    } else {
+    if(!magnetActive) {
       currentState = READY;
+    } else {
+      currentState = MAGNET_ACTIVE;
     }
     
     uint8_t status = STATUS_STOPPED;
     statusCharacteristic.writeValue(&status, 1);
     
-    if(Serial) {
-      unsigned long duration = millis() - rotationStartTime;
-      Serial.print("→ Rotation stopped after ");
-      Serial.print(duration);
-      Serial.println(" ms");
-    }
-  } else {
-    if(Serial) Serial.println("⚠ Not rotating");
+    if(Serial) Serial.println("Rotation stopped");
   }
 }
 
@@ -231,18 +221,57 @@ void updateRotation() {
   }
 }
 
+void handleButtonPress() {
+  // Read button state (LOW when pressed due to INPUT_PULLUP)
+  bool currentButtonState = digitalRead(CALIBRATION_BUTTON_PIN) == LOW;
+  
+  if(currentButtonState && !buttonPressed) {
+    // Button just pressed
+    buttonPressed = true;
+    buttonPressStartTime = millis();
+    calibrationTriggered = false;
+    if(Serial) Serial.println("🔘 Calibration button pressed");
+    
+  } else if(!currentButtonState && buttonPressed) {
+    // Button released
+    buttonPressed = false;
+    calibrationTriggered = false;
+    if(Serial) Serial.println("🔘 Calibration button released");
+    
+  } else if(currentButtonState && buttonPressed && !calibrationTriggered) {
+    // Button is held
+    unsigned long holdTime = millis() - buttonPressStartTime;
+    
+    if(holdTime >= BUTTON_HOLD_TIME) {
+      // Trigger calibration
+      calibrationTriggered = true;
+      if(Serial) {
+        Serial.println("🔧 Calibration triggered!");
+        Serial.print("   Button held for ");
+        Serial.print(holdTime);
+        Serial.println(" ms");
+      }
+      
+      // Send notification to Raspberry Pi via buttonCharacteristic
+      uint8_t buttonNotification = BUTTON_PRESSED;
+      buttonCharacteristic.writeValue(&buttonNotification, 1);
+    }
+  }
+}
+
 void loop() {
   BLEDevice central = BLE.central();
   
   BLE.poll();
 
+  // Handle button press for calibration
+  handleButtonPress();
+
   switch(currentState) {
     case DISCONNECTED:
       if(central && central.connected()) {
-        if(Serial) {
-          Serial.print("✓ Connected to central: ");
-          Serial.println(central.address());
-        }
+        if(Serial) Serial.print("Connected to central: ");
+        if(Serial) Serial.println(central.address());
         currentState = READY;
         
         uint8_t status = STATUS_READY;
@@ -253,16 +282,11 @@ void loop() {
     case READY:
     case MAGNET_ACTIVE:
     case ROTATING:
-      if(!central || !central.connected()) {
-        if(Serial) Serial.println("✗ Disconnected from central");
+      if(!central.connected()) {
+        if(Serial) Serial.println("Disconnected from central");
         
         // Safety: Stop everything on disconnect
-        if(isRotating) {
-          stopRotation();
-        }
-        if(magnetActive) {
-          deactivateMagnet();
-        }
+        stopRotation();
         currentState = DISCONNECTED;
       }
       
@@ -271,6 +295,7 @@ void loop() {
       break;
   }
   
-  // Small delay
+  // Small delay to prevent overwhelming the loop
   delay(1);
 }
+
