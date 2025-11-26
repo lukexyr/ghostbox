@@ -136,6 +136,14 @@ class JetDevice:
         except struct.error as e:
             logger.error(f"[{self.name}] Struct unpack error: {e}")
             return
+        
+        logger.info(
+            f"t={timestamp_ms:7d} ms | "
+            f"Accel=({accelX:7.3f}, {accelY:7.3f}, {accelZ:7.3f}) | "
+            f"Quat=({q0:6.3f}, {q1:6.3f}, {q2:6.3f}, {q3:6.3f}) | "
+            f"Mag=({magX:7.2f}, {magY:7.2f}, {magZ:7.2f}) | "
+            f"T={temp:5.2f}°C"
+            )
 
     async def notification_handler_mag(self, sender, data):
         """Handle magnetometer data during calibration"""
@@ -415,6 +423,7 @@ class SystemController:
         self._state_lock = asyncio.Lock()
         self._workflow_active = False
         self._calibration_active = False
+        self._magnet_timeout_task = None
 
     async def on_jet_idle(self):
         async with self._state_lock:
@@ -435,12 +444,32 @@ class SystemController:
                 self.state = SystemState.JET_RUNNING
                 return
             
-            await asyncio.sleep(0.5)
             self.state = SystemState.WAITING_FOR_PLATFORM
-            logger.info("⏳ Waiting for platform detection...")
+            logger.info("⏳ Waiting for platform detection (1 second window)...")
+            
+            # Start timeout task - deactivate magnet after 1 second
+            self._magnet_timeout_task = asyncio.create_task(self._magnet_timeout())
 
-            await asyncio.sleep(0.5)
-            await self.table.deactivate_magnet()
+    async def _magnet_timeout(self):
+        """Deactivate magnet after 1 second if no platform detected"""
+        try:
+            await asyncio.sleep(1.0)
+            
+            async with self._state_lock:
+                if self.state == SystemState.WAITING_FOR_PLATFORM:
+                    logger.info("\n" + "="*60)
+                    logger.info("⏱️  TIMEOUT: No platform detected within 1 second")
+                    logger.info("="*60 + "\n")
+                    
+                    await self.table.deactivate_magnet()
+                    
+                    logger.info("⚠️  Workflow aborted - returning to normal operation")
+                    self.state = SystemState.JET_RUNNING
+                    self._workflow_active = False
+                    self._magnet_timeout_task = None
+        except asyncio.CancelledError:
+            # Timeout was cancelled because platform was detected
+            logger.debug("Magnet timeout cancelled - platform was detected")
 
     async def on_platform_detected(self):
         async with self._state_lock:
@@ -448,12 +477,20 @@ class SystemController:
                 logger.debug(f"Platform detected but wrong state: {self.state}")
                 return
             
+            # Cancel the timeout task since platform was detected
+            if self._magnet_timeout_task:
+                self._magnet_timeout_task.cancel()
+                self._magnet_timeout_task = None
+            
             logger.info("\n" + "="*60)
-            logger.info("🎯 WORKFLOW: Platform detected → Starting rotation")
+            logger.info("🎯 WORKFLOW: Platform detected → Deactivating magnet and starting rotation")
             logger.info("="*60 + "\n")
             
             self.state = SystemState.PLATFORM_DETECTED
-            await asyncio.sleep(1.0)
+            
+            # Deactivate magnet before rotation
+            await self.table.deactivate_magnet()
+            await asyncio.sleep(0.5)
             
             success = await self.table.start_rotation()
             if not success:
@@ -526,9 +563,13 @@ class SystemController:
 
     async def _abort_workflow(self):
         """Abort workflow and return to safe state"""
-        await self.table.stop_rotation()
-        await asyncio.sleep(0.2)
+        # Cancel any pending timeout
+        if self._magnet_timeout_task:
+            self._magnet_timeout_task.cancel()
+            self._magnet_timeout_task = None
+        
         await self.table.deactivate_magnet()
+        await self.table.stop_rotation()
         
         logger.info("⚠️  Workflow aborted - returning to normal operation")
         self.state = SystemState.JET_RUNNING
